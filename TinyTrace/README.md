@@ -136,6 +136,19 @@ Put matching QVHighlights train clips here:
 qvhighlights/videos/train/
 ```
 
+To auto-download valid QVHighlights clips, run the downloader from the project root folder:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/download_qvhighlights_subset.py --target-count 50
+```
+
+This will:
+
+- create `dataset/qvhighlights/videos/train/` if it does not exist
+- download valid clips automatically
+- save the matched annotation subset to `dataset/qvhighlights/mt_fmt-50-valid.json`
+
 Then convert the downloaded clips into TinyTrace JSON:
 
 ```bash
