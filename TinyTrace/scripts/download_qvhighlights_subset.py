@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         "--target-count",
         type=int,
         default=50,
-        help="How many valid clips to collect.",
+        help="Target total number of valid clips to have in the output folder.",
     )
     parser.add_argument(
         "--max-scan",
@@ -55,8 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yt-dlp-bin",
         type=str,
-        default="TinyTrace/.venv/bin/yt-dlp",
-        help="Path to yt-dlp executable.",
+        default="TinyTrace/.venv/bin/python -m yt_dlp",
+        help="Command used to run yt-dlp.",
     )
     return parser.parse_args()
 
@@ -72,10 +72,14 @@ def parse_clip_name(path_str: str) -> tuple[str, str, str, str]:
     return youtube_id, start, end, stem
 
 
+def yt_dlp_command(command: str) -> list[str]:
+    return command.split()
+
+
 def check_video_available(root: Path, yt_dlp_bin: str, url: str, timeout: int) -> bool:
     try:
         result = subprocess.run(
-            [yt_dlp_bin, "--skip-download", "--quiet", url],
+            yt_dlp_command(yt_dlp_bin) + ["--skip-download", "--quiet", url],
             cwd=root,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -97,8 +101,8 @@ def download_clip(
 ) -> bool:
     try:
         result = subprocess.run(
-            [
-                yt_dlp_bin,
+            yt_dlp_command(yt_dlp_bin)
+            + [
                 url,
                 "-f",
                 "bv*[height<=360]+ba/b[height<=360]/b",
@@ -128,17 +132,36 @@ def main() -> None:
 
     if not source_json.exists():
         raise FileNotFoundError(f"Source JSON not found: {source_json}")
-    if not (root / yt_dlp_bin).exists() and not Path(yt_dlp_bin).exists():
-        raise FileNotFoundError(f"yt-dlp binary not found: {yt_dlp_bin}")
+    yt_parts = yt_dlp_command(yt_dlp_bin)
+    runner = Path(yt_parts[0])
+    if not (root / runner).exists() and not runner.exists():
+        raise FileNotFoundError(f"yt-dlp runner not found: {runner}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     subset_json.parent.mkdir(parents=True, exist_ok=True)
 
     items = json.loads(source_json.read_text())
+    existing_mp4_names = {path.name for path in output_dir.glob("*.mp4")}
     selected = []
 
+    print(f"Existing completed mp4 files: {len(existing_mp4_names)}")
+    if len(existing_mp4_names) >= args.target_count:
+        print(f"Target already reached: {len(existing_mp4_names)} >= {args.target_count}")
+        all_valid_items = []
+        seen = set()
+        for item in items:
+            name = Path(item["video"]).name
+            if name in existing_mp4_names and name not in seen:
+                all_valid_items.append(item)
+                seen.add(name)
+        subset_json.write_text(json.dumps(all_valid_items, indent=2))
+        print(f"Video folder: {output_dir}")
+        print(f"Subset annotations: {subset_json}")
+        return
+
     for item in items[: args.max_scan]:
-        if len(selected) >= args.target_count:
+        current_total = len(existing_mp4_names) + len(selected)
+        if current_total >= args.target_count:
             break
 
         clip_path = item["video"]
@@ -146,7 +169,7 @@ def main() -> None:
         url = f"https://www.youtube.com/watch?v={youtube_id}"
         output_file = output_dir / f"{clip_name}.mp4"
 
-        if output_file.exists():
+        if output_file.name in existing_mp4_names:
             print(f"[keep] {clip_name}")
             selected.append(item)
             continue
@@ -168,13 +191,22 @@ def main() -> None:
 
         if ok:
             selected.append(item)
-            print(f"[saved {len(selected)}/{args.target_count}] {output_file}")
+            print(f"[saved total {len(existing_mp4_names) + len(selected)}/{args.target_count}] {output_file}")
         else:
             print(f"[failed] {clip_name}")
 
-    subset_json.write_text(json.dumps(selected, indent=2))
+    final_mp4_names = {path.name for path in output_dir.glob("*.mp4")}
+    all_valid_items = []
+    seen = set()
+    for item in items:
+        name = Path(item["video"]).name
+        if name in final_mp4_names and name not in seen:
+            all_valid_items.append(item)
+            seen.add(name)
+
+    subset_json.write_text(json.dumps(all_valid_items, indent=2))
     print()
-    print(f"Downloaded/kept valid clips: {len(selected)}")
+    print(f"Completed valid mp4 files now present: {len(final_mp4_names)}")
     print(f"Video folder: {output_dir}")
     print(f"Subset annotations: {subset_json}")
 

@@ -206,6 +206,60 @@ PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrac
   --output-dir TinyTrace/outputs-qvh-smoke
 ```
 
+## Use The Final 500-Video Dataset Folder
+
+The final cleaned dataset prepared for TinyTrace is stored here:
+
+```bash
+dataset/final_qvhighlights_tinytrace/
+```
+
+It contains:
+
+- `videos/train/` : 450 valid training clips
+- `videos/val/` : 50 valid validation clips
+- `annotations/tinytrace_train.json` : TinyTrace-ready training annotations
+- `annotations/tinytrace_val.json` : TinyTrace-ready validation annotations
+- `annotations/qvh_raw_valid_500.json` : filtered original-format annotations for the same 500 valid clips
+
+You do not need to move this folder anywhere else. Keep it exactly under:
+
+```bash
+dataset/final_qvhighlights_tinytrace/
+```
+
+and run training from the project root:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/train_tinytrace.py \
+  --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_train.json \
+  --epochs 10 \
+  --batch-size 2 \
+  --output-dir TinyTrace/outputs-qvh-final
+```
+
+To inspect one validation sample after training:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace.py \
+  --checkpoint TinyTrace/outputs-qvh-final/tinytrace.pt \
+  --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
+  --sample-index 0
+```
+
+To run TRACE-style highlight metrics on the validation split:
+
+```bash
+cd /home/vikaspal/Desktop/Traceall
+PYTHONPATH=TinyTrace TinyTrace/.venv/bin/python TinyTrace/scripts/eval_tinytrace_vhd.py \
+  --checkpoint TinyTrace/outputs-qvh-final/tinytrace.pt \
+  --dataset-json dataset/final_qvhighlights_tinytrace/annotations/tinytrace_val.json \
+  --source-json dataset/final_qvhighlights_tinytrace/annotations/qvh_raw_valid_500.json \
+  --save-path TinyTrace/outputs-qvh-final/qvh_val_metrics.json
+```
+
 ## Check One Video's Prediction
 
 To inspect what TinyTrace currently predicts for one video:
