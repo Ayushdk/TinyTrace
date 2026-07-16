@@ -34,3 +34,9 @@ TinyTrace/**/*.log
 # OS files
 .DS_Store
 Thumbs.db
+.claude/settings.local.json
+.tokensave/branch-meta.json
+.tokensave/config.json
+.tokensave/tokensave.db-shm
+.tokensave/tokensave.db-wal
+.tokensave/tokensave.db
