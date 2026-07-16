@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import math
 import random
 import re
 import subprocess
@@ -14,6 +15,33 @@ from torch.utils.data import Dataset
 from .config import TinyTraceConfig
 from .serialization import serialize_example
 from .tokenizers import CharTokenizer, NumericTokenizer
+
+
+FRAME_CACHE_FORMAT_VERSION = 2
+
+
+def sample_uniform_frame_times(
+    duration: float,
+    requested_frames: int,
+    safety_margin: float = 0.25,
+) -> torch.Tensor:
+    """Return deterministic, monotonic timestamps inside a safe decode range.
+
+    Videos whose safe decode range collapses to zero return one valid timestamp
+    instead of duplicating the first frame to imitate additional evidence.
+    Variable-frame collation supplies the corresponding padding mask.
+    """
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"Video duration must be finite and positive, received {duration!r}.")
+    if not isinstance(requested_frames, int) or isinstance(requested_frames, bool) or requested_frames < 1:
+        raise ValueError("requested_frames must be a positive integer.")
+    if not math.isfinite(safety_margin) or safety_margin < 0:
+        raise ValueError("safety_margin must be finite and non-negative.")
+
+    safe_end = max(float(duration) - float(safety_margin), 0.0)
+    if requested_frames == 1 or safe_end == 0.0:
+        return torch.zeros(1, dtype=torch.float32)
+    return torch.linspace(0.0, safe_end, steps=requested_frames, dtype=torch.float32)
 
 
 class SyntheticTinyTraceDataset(Dataset):
@@ -104,6 +132,7 @@ class JsonTinyTraceDataset(Dataset):
         config: TinyTraceConfig,
         frame_cache_dir: str | Path | None = None,
         allow_random_frames: bool = True,
+        validate_videos_on_init: bool = False,
     ) -> None:
         self.annotation_path = Path(annotation_path)
         self.config = config
@@ -116,10 +145,28 @@ class JsonTinyTraceDataset(Dataset):
         payload = json.loads(self.annotation_path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):
             raise ValueError("TinyTrace JSON dataset must be a list of samples.")
-        self.items = self._filter_valid_items(payload)
+        if not all(isinstance(item, dict) for item in payload):
+            raise ValueError("Each TinyTrace JSON sample must be an object.")
+        self.items = (
+            self._filter_valid_items(payload)
+            if validate_videos_on_init
+            else [self._resolve_item_video_path(item) for item in payload]
+        )
 
-    def _resolve_video_path(self, video_path: str) -> Path:
-        source = Path(video_path)
+    def _resolve_item_video_path(self, item: dict) -> dict:
+        if not isinstance(item, dict):
+            raise ValueError("Each TinyTrace JSON sample must be an object.")
+        resolved = dict(item)
+        if item.get("video_path"):
+            source = self._resolve_media_path(str(item["video_path"]))
+            resolved["video_path"] = str(source)
+        if item.get("frames_path"):
+            source = self._resolve_media_path(str(item["frames_path"]))
+            resolved["frames_path"] = str(source)
+        return resolved
+
+    def _resolve_media_path(self, media_path: str) -> Path:
+        source = Path(media_path)
         if source.is_absolute():
             return source
         if source.is_file():
@@ -157,23 +204,31 @@ class JsonTinyTraceDataset(Dataset):
                 valid_items.append(item)
                 continue
 
-            source = self._resolve_video_path(video_path)
+            source = self._resolve_media_path(video_path)
             if not source.is_file():
                 skipped_missing += 1
                 continue
             item = dict(item)
             item["video_path"] = str(source)
 
-            duration = self._probe_video_duration(str(source))
+            try:
+                duration = self._probe_video_duration(str(source))
+            except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
+                skipped_invalid += 1
+                continue
             if duration <= 0:
                 skipped_invalid += 1
                 continue
 
-            max_event_time = 0.0
-            for event in item.get("events", []):
-                timestamp = event.get("timestamp", [])
-                if isinstance(timestamp, list) and timestamp:
-                    max_event_time = max(max_event_time, max(float(value) for value in timestamp))
+            try:
+                max_event_time = 0.0
+                for event in item.get("events", []):
+                    timestamp = event.get("timestamp", [])
+                    if isinstance(timestamp, list) and timestamp:
+                        max_event_time = max(max_event_time, max(float(value) for value in timestamp))
+            except (AttributeError, TypeError, ValueError):
+                skipped_invalid += 1
+                continue
 
             if max_event_time > duration + 0.5:
                 skipped_invalid += 1
@@ -227,15 +282,31 @@ class JsonTinyTraceDataset(Dataset):
         return min(positive) if positive else 0.0
 
     def _convert_sample(self, item: dict) -> dict:
-        num_frames = int(item.get("num_frames", self.config.max_frames))
-        height = int(item.get("image_size", self.config.image_size))
-        width = int(item.get("image_size", self.config.image_size))
+        num_frames = item.get("num_frames", self.config.max_frames)
+        if not isinstance(num_frames, int) or isinstance(num_frames, bool):
+            raise ValueError("num_frames must be an integer.")
+        if not 1 <= num_frames <= self.config.max_frames:
+            raise ValueError(
+                f"num_frames must be between 1 and configured max_frames={self.config.max_frames}."
+            )
+        image_size = item.get("image_size", self.config.image_size)
+        if not isinstance(image_size, int) or isinstance(image_size, bool) or image_size < 1:
+            raise ValueError("image_size must be a positive integer.")
+        height = image_size
+        width = image_size
 
         if "video_path" in item:
             frames, frame_times_tensor = self._load_video_frames_cached(item["video_path"], num_frames)
         elif "frames_path" in item:
-            frames = torch.load(item["frames_path"], map_location="cpu", weights_only=True).float()
-            frame_times_tensor = torch.linspace(0.0, float(num_frames - 1), steps=num_frames)
+            loaded_frames = torch.load(item["frames_path"], map_location="cpu", weights_only=True)
+            if not isinstance(loaded_frames, torch.Tensor):
+                raise ValueError("frames_path must contain a frame tensor.")
+            frames = loaded_frames.float()
+            frame_times_tensor = torch.linspace(
+                0.0,
+                float(max(frames.size(0) - 1, 0)),
+                steps=frames.size(0),
+            )
         elif self.allow_random_frames:
             frames = torch.rand(num_frames, 3, height, width)
             frame_times_tensor = torch.linspace(0.0, float(num_frames - 1), steps=num_frames)
@@ -244,6 +315,22 @@ class JsonTinyTraceDataset(Dataset):
                 "Real-data sample must define video_path or frames_path; "
                 "random fallback frames are disabled."
             )
+
+        if (
+            frames.ndim != 4
+            or not 1 <= frames.size(0) <= num_frames
+            or frames.size(1) != 3
+        ):
+            raise ValueError(
+                "Decoded frames must contain between 1 and "
+                f"{num_frames} RGB frames, received {tuple(frames.shape)}."
+            )
+        if not frames.is_floating_point() or not torch.isfinite(frames).all():
+            raise ValueError("Decoded frames must be finite floating-point tensors.")
+        if frames.numel() and (frames.min() < 0 or frames.max() > 1):
+            raise ValueError("Decoded frames must be in the [0, 1] range.")
+        if frame_times_tensor.shape != (frames.size(0),):
+            raise ValueError("frame_times must contain one timestamp per decoded frame.")
 
         instruction = item.get("instruction", "localize events and describe them")
         events = item.get("events", [])
@@ -278,31 +365,82 @@ class JsonTinyTraceDataset(Dataset):
                 str(stat.st_mtime_ns if stat else "missing"),
                 str(num_frames),
                 str(self.config.image_size),
+                str(FRAME_CACHE_FORMAT_VERSION),
             ]
         )
         cache_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         cache_path = self.frame_cache_dir / f"{cache_key}.pt"
         if cache_path.is_file():
-            cached = torch.load(cache_path, map_location="cpu", weights_only=True)
-            return cached["frames"], cached["frame_times"]
+            cached = self._read_frame_cache(cache_path, num_frames)
+            if cached is not None:
+                return cached
 
         frames, frame_times = self._load_video_frames(video_path, num_frames)
         self.frame_cache_dir.mkdir(parents=True, exist_ok=True)
         temporary_path = cache_path.with_name(f"{cache_path.name}.{uuid.uuid4().hex}.tmp")
         try:
-            torch.save({"frames": frames, "frame_times": frame_times}, temporary_path)
+            torch.save(
+                {
+                    "format_version": FRAME_CACHE_FORMAT_VERSION,
+                    "frames": frames,
+                    "frame_times": frame_times,
+                },
+                temporary_path,
+            )
             temporary_path.replace(cache_path)
         finally:
             temporary_path.unlink(missing_ok=True)
         return frames, frame_times
+
+    def _read_frame_cache(
+        self,
+        cache_path: Path,
+        num_frames: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        try:
+            cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+            if not isinstance(cached, dict):
+                raise ValueError("cache payload is not an object")
+            if cached.get("format_version") != FRAME_CACHE_FORMAT_VERSION:
+                raise ValueError("cache format version does not match")
+            frames = cached["frames"]
+            frame_times = cached["frame_times"]
+            expected_spatial_shape = (3, self.config.image_size, self.config.image_size)
+            if (
+                not isinstance(frames, torch.Tensor)
+                or frames.ndim != 4
+                or not 1 <= frames.size(0) <= num_frames
+                or tuple(frames.shape[1:]) != expected_spatial_shape
+            ):
+                raise ValueError(
+                    "cached frames must contain between 1 and "
+                    f"{num_frames} frames with shape {expected_spatial_shape}, "
+                    f"received {getattr(frames, 'shape', None)}"
+                )
+            if frames.dtype != torch.float32 or not torch.isfinite(frames).all():
+                raise ValueError("cached frames must be finite float32 tensors")
+            if frames.numel() and (frames.min() < 0 or frames.max() > 1):
+                raise ValueError("cached frames must be in the [0, 1] range")
+            if not isinstance(frame_times, torch.Tensor) or tuple(frame_times.shape) != (frames.size(0),):
+                raise ValueError("cached frame_times have an invalid shape")
+            if frame_times.dtype != torch.float32 or not torch.isfinite(frame_times).all():
+                raise ValueError("cached frame_times must be finite float32 tensors")
+            if frame_times.numel() and frame_times[0] < 0:
+                raise ValueError("cached frame_times cannot be negative")
+            if frame_times.numel() > 1 and (frame_times[1:] < frame_times[:-1]).any():
+                raise ValueError("cached frame_times must be monotonically nondecreasing")
+            return frames, frame_times
+        except Exception as exc:
+            cache_path.unlink(missing_ok=True)
+            print(f"Ignoring invalid TinyTrace frame cache {cache_path}: {exc}")
+            return None
 
     def _load_video_frames(self, video_path: str, num_frames: int) -> tuple[torch.Tensor, torch.Tensor]:
         duration = self._probe_video_duration(video_path)
         if duration <= 0:
             raise ValueError(f"Invalid video duration: {video_path}")
 
-        safe_end = max(duration - 0.25, 0.0)
-        frame_times = torch.linspace(0.0, safe_end, steps=num_frames)
+        frame_times = sample_uniform_frame_times(duration, num_frames)
         frames = []
         for timestamp in frame_times.tolist():
             frame = self._read_single_frame(video_path, timestamp)

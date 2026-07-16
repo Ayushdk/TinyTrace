@@ -1,12 +1,20 @@
 import json
+import subprocess
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 
 from tinytrace.config import TinyTraceConfig
-from tinytrace.data import JsonTinyTraceDataset, SyntheticTinyTraceDataset, tinytrace_collate_fn
+from tinytrace.data import (
+    JsonTinyTraceDataset,
+    SyntheticTinyTraceDataset,
+    sample_uniform_frame_times,
+    tinytrace_collate_fn,
+)
 from tinytrace.model import TinyTraceModel
 from tinytrace.tokenizers import NumericTokenizer
 
@@ -14,6 +22,30 @@ from test_vision import FakeMobileCLIPBackbone
 
 
 class StabilityTests(unittest.TestCase):
+    def test_uniform_frame_sampling_is_deterministic_and_bounded(self) -> None:
+        first = sample_uniform_frame_times(duration=10.0, requested_frames=4)
+        second = sample_uniform_frame_times(duration=10.0, requested_frames=4)
+
+        self.assertTrue(torch.equal(first, second))
+        self.assertEqual(first.shape, (4,))
+        self.assertEqual(first[0].item(), 0.0)
+        self.assertAlmostEqual(first[-1].item(), 9.75)
+        self.assertTrue((first[1:] > first[:-1]).all())
+
+    def test_short_video_sampling_avoids_duplicate_frames(self) -> None:
+        frame_times = sample_uniform_frame_times(duration=0.1, requested_frames=8)
+
+        self.assertEqual(frame_times.tolist(), [0.0])
+
+    def test_uniform_frame_sampling_rejects_invalid_inputs(self) -> None:
+        for duration in (0.0, -1.0, float("nan")):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(ValueError, "duration"):
+                    sample_uniform_frame_times(duration=duration, requested_frames=8)
+
+        with self.assertRaisesRegex(ValueError, "requested_frames"):
+            sample_uniform_frame_times(duration=1.0, requested_frames=0)
+
     def test_json_dataset_decodes_lazily_and_reuses_frame_cache(self) -> None:
         class CountingDataset(JsonTinyTraceDataset):
             decode_calls = 0
@@ -67,6 +99,139 @@ class StabilityTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "random fallback frames are disabled"):
                 dataset[0]
+
+    def test_invalid_frame_cache_is_regenerated(self) -> None:
+        class CountingDataset(JsonTinyTraceDataset):
+            decode_calls = 0
+
+            def _load_video_frames(self, video_path: str, num_frames: int):
+                self.decode_calls += 1
+                return (
+                    torch.ones(num_frames, 3, self.config.image_size, self.config.image_size),
+                    torch.arange(num_frames, dtype=torch.float32),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            annotations = root / "samples.json"
+            annotations.write_text(
+                json.dumps([{"video_path": str(root / "video.mp4"), "num_frames": 2, "events": []}]),
+                encoding="utf-8",
+            )
+            dataset = CountingDataset(
+                annotations,
+                TinyTraceConfig(image_size=16, max_frames=2),
+                frame_cache_dir=root / "cache",
+                allow_random_frames=False,
+            )
+
+            dataset[0]
+            cache_path = next((root / "cache").glob("*.pt"))
+            torch.save({"format_version": -1, "frames": torch.zeros(1)}, cache_path)
+
+            regenerated = dataset[0]
+
+            self.assertEqual(dataset.decode_calls, 2)
+            self.assertEqual(regenerated["frames"].shape, (2, 3, 16, 16))
+
+    def test_concurrent_frame_cache_writers_leave_one_valid_entry(self) -> None:
+        barrier = threading.Barrier(2)
+
+        class ConcurrentDataset(JsonTinyTraceDataset):
+            def _load_video_frames(self, video_path: str, num_frames: int):
+                barrier.wait(timeout=5)
+                return (
+                    torch.ones(num_frames, 3, self.config.image_size, self.config.image_size),
+                    torch.arange(num_frames, dtype=torch.float32),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            annotations = root / "samples.json"
+            annotations.write_text(
+                json.dumps([{"video_path": str(root / "video.mp4"), "num_frames": 2, "events": []}]),
+                encoding="utf-8",
+            )
+            dataset = ConcurrentDataset(
+                annotations,
+                TinyTraceConfig(image_size=16, max_frames=2),
+                frame_cache_dir=root / "cache",
+                allow_random_frames=False,
+            )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: dataset[0], range(2)))
+
+            cache_files = list((root / "cache").glob("*.pt"))
+            temporary_files = list((root / "cache").glob("*.tmp"))
+            self.assertEqual(len(cache_files), 1)
+            self.assertEqual(temporary_files, [])
+            self.assertTrue(torch.equal(results[0]["frames"], results[1]["frames"]))
+            self.assertIsNotNone(dataset._read_frame_cache(cache_files[0], num_frames=2))
+
+    def test_json_dataset_rejects_non_object_samples_and_excess_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = root / "malformed.json"
+            malformed.write_text(json.dumps([1]), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be an object"):
+                JsonTinyTraceDataset(malformed, TinyTraceConfig(max_frames=2))
+
+            excessive = root / "excessive.json"
+            excessive.write_text(json.dumps([{"num_frames": 3, "events": []}]), encoding="utf-8")
+            dataset = JsonTinyTraceDataset(excessive, TinyTraceConfig(max_frames=2))
+            with self.assertRaisesRegex(ValueError, "configured max_frames=2"):
+                dataset[0]
+
+    def test_optional_video_validation_skips_probe_failures(self) -> None:
+        class ProbeFailureDataset(JsonTinyTraceDataset):
+            @staticmethod
+            def _probe_video_duration(video_path: str) -> float:
+                raise subprocess.CalledProcessError(1, ["ffprobe", video_path])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid_video = root / "invalid.mp4"
+            invalid_video.touch()
+            annotations = root / "samples.json"
+            annotations.write_text(
+                json.dumps(
+                    [
+                        {"video_path": str(invalid_video), "events": []},
+                        {"num_frames": 1, "events": []},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            dataset = ProbeFailureDataset(
+                annotations,
+                TinyTraceConfig(max_frames=2),
+                validate_videos_on_init=True,
+            )
+
+            self.assertEqual(len(dataset), 1)
+
+    def test_relative_precomputed_frames_are_resolved_and_variable_length(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frames_path = root / "frames.pt"
+            torch.save(torch.ones(1, 3, 8, 8), frames_path)
+            annotations = root / "samples.json"
+            annotations.write_text(
+                json.dumps([{"frames_path": "frames.pt", "num_frames": 2, "events": []}]),
+                encoding="utf-8",
+            )
+
+            dataset = JsonTinyTraceDataset(
+                annotations,
+                TinyTraceConfig(image_size=8, max_frames=2),
+                allow_random_frames=False,
+            )
+            sample = dataset[0]
+
+            self.assertEqual(sample["frames"].shape, (1, 3, 8, 8))
+            self.assertEqual(sample["frame_times"].tolist(), [0.0])
 
     def test_numeric_tokenizer_round_trip(self) -> None:
         config = TinyTraceConfig()

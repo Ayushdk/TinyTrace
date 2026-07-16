@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,10 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(1) > self.pe.size(1):
+            raise ValueError(
+                f"Sequence length {x.size(1)} exceeds positional capacity {self.pe.size(1)}."
+            )
         return x + self.pe[:, : x.size(1)]
 
 
@@ -123,6 +127,9 @@ class TinyTraceOutput:
     text_logits: torch.Tensor
     time_logits: torch.Tensor
     score_logits: torch.Tensor
+    loss_components: dict[str, torch.Tensor] = field(default_factory=dict)
+    weighted_loss_components: dict[str, torch.Tensor] = field(default_factory=dict)
+    target_counts: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class TinyTraceModel(nn.Module):
@@ -144,7 +151,7 @@ class TinyTraceModel(nn.Module):
         self.time_embeddings = nn.Embedding(len(config.time_vocab), config.d_model)
         self.score_embeddings = nn.Embedding(len(config.score_vocab), config.d_model)
         self.token_type_embeddings = nn.Embedding(4, config.d_model)
-        self.position = PositionalEncoding(config.d_model)
+        self.position = PositionalEncoding(config.d_model, max_len=config.max_position_embeddings)
         self.dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.num_layers)])
         self.final_norm = nn.LayerNorm(config.d_model)
@@ -155,6 +162,29 @@ class TinyTraceModel(nn.Module):
 
     def set_visual_encoder_trainable(self, trainable: bool, strategy: str = "full") -> None:
         self.visual_encoder.set_mobileclip_trainable(trainable, strategy=strategy)
+
+    def _loss_component_weight(self, name: str) -> float:
+        if name == "time":
+            return self.config.time_loss_weight
+        if name == "score":
+            return self.config.score_loss_weight
+        if name == "text":
+            return self.config.caption_loss_weight
+        if name in {"time_sync", "score_sync", "caption_sync"}:
+            return self.config.sync_loss_weight
+        if name == "boundary":
+            return self.config.boundary_loss_weight
+        raise KeyError(f"Unknown TinyTrace loss component: {name}")
+
+    def _combine_loss_components(
+        self,
+        components: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        weighted = {
+            name: value * self._loss_component_weight(name)
+            for name, value in components.items()
+        }
+        return (sum(weighted.values()) if weighted else None), weighted
 
     def _encode_frame_time_ids(self, frame_times: torch.Tensor) -> torch.Tensor:
         if frame_times.ndim != 2:
@@ -326,6 +356,12 @@ class TinyTraceModel(nn.Module):
         frame_mask: torch.Tensor | None = None,
         visual_patch_features: torch.Tensor | None = None,
     ) -> TinyTraceOutput:
+        if (labels is None) != (label_types is None):
+            raise ValueError("labels and label_types must either both be provided or both be omitted.")
+        if labels is not None and labels.shape != token_ids.shape:
+            raise ValueError("labels must have the same shape as token_ids.")
+        if label_types is not None and label_types.shape != token_ids.shape:
+            raise ValueError("label_types must have the same shape as token_ids.")
         visual_tokens = self.build_visual_prefix(
             frames,
             frame_times,
@@ -357,6 +393,9 @@ class TinyTraceModel(nn.Module):
         full_logits[:, :, self.config.score_token_base :] = score_logits
 
         loss = None
+        loss_components: dict[str, torch.Tensor] = {}
+        weighted_loss_components: dict[str, torch.Tensor] = {}
+        target_counts: dict[str, torch.Tensor] = {}
         if labels is not None and label_types is not None:
             prompt_len = visual_tokens.size(1)
             hidden_text = text_logits[:, prompt_len:-1]
@@ -367,38 +406,44 @@ class TinyTraceModel(nn.Module):
             target_types = label_types[:, 1:]
             valid_mask = target_types >= 0
 
-            loss_terms = []
-
             text_mask = (target_types == 0) & valid_mask
             if text_mask.any():
-                loss_terms.append(F.cross_entropy(hidden_text[text_mask], target_tokens[text_mask]))
+                loss_components["text"] = F.cross_entropy(hidden_text[text_mask], target_tokens[text_mask])
+                target_counts["text"] = text_mask.sum().detach()
 
             caption_sync_mask = (target_types == 1) & valid_mask
             if caption_sync_mask.any():
                 sync_targets = torch.full_like(target_tokens[caption_sync_mask], self.config.text_vocab_size)
-                loss_terms.append(F.cross_entropy(hidden_text[caption_sync_mask], sync_targets))
+                loss_components["caption_sync"] = F.cross_entropy(hidden_text[caption_sync_mask], sync_targets)
+                target_counts["caption_sync"] = caption_sync_mask.sum().detach()
 
             time_mask = (target_types == 2) & valid_mask
             if time_mask.any():
-                loss_terms.append(
-                    F.cross_entropy(hidden_time[time_mask], target_tokens[time_mask] - self.config.time_token_base)
+                loss_components["time"] = F.cross_entropy(
+                    hidden_time[time_mask],
+                    target_tokens[time_mask] - self.config.time_token_base,
                 )
+                target_counts["time"] = time_mask.sum().detach()
 
             time_sync_mask = (target_types == 4) & valid_mask
             if time_sync_mask.any():
                 time_sync_targets = torch.zeros_like(target_tokens[time_sync_mask])
-                loss_terms.append(F.cross_entropy(hidden_time[time_sync_mask], time_sync_targets))
+                loss_components["time_sync"] = F.cross_entropy(hidden_time[time_sync_mask], time_sync_targets)
+                target_counts["time_sync"] = time_sync_mask.sum().detach()
 
             score_mask = (target_types == 3) & valid_mask
             if score_mask.any():
-                loss_terms.append(
-                    F.cross_entropy(hidden_score[score_mask], target_tokens[score_mask] - self.config.score_token_base)
+                loss_components["score"] = F.cross_entropy(
+                    hidden_score[score_mask],
+                    target_tokens[score_mask] - self.config.score_token_base,
                 )
+                target_counts["score"] = score_mask.sum().detach()
 
             score_sync_mask = (target_types == 5) & valid_mask
             if score_sync_mask.any():
                 score_sync_targets = torch.zeros_like(target_tokens[score_sync_mask])
-                loss_terms.append(F.cross_entropy(hidden_score[score_sync_mask], score_sync_targets))
+                loss_components["score_sync"] = F.cross_entropy(hidden_score[score_sync_mask], score_sync_targets)
+                target_counts["score_sync"] = score_sync_mask.sum().detach()
 
             # A caption <sync> is followed either by EOS (final event) or by
             # the first timestamp token (another event). The task heads are
@@ -420,11 +465,24 @@ class TinyTraceModel(nn.Module):
                     torch.zeros_like(boundary_tokens),
                     boundary_tokens - self.config.time_token_base + 1,
                 )
-                loss_terms.append(F.cross_entropy(boundary_logits[boundary_mask], boundary_targets))
+                loss_components["boundary"] = F.cross_entropy(
+                    boundary_logits[boundary_mask],
+                    boundary_targets,
+                )
+                target_counts["boundary"] = boundary_mask.sum().detach()
 
-            loss = sum(loss_terms) if loss_terms else None
+            loss, weighted_loss_components = self._combine_loss_components(loss_components)
 
-        return TinyTraceOutput(loss=loss, logits=full_logits, text_logits=text_logits, time_logits=time_logits, score_logits=score_logits)
+        return TinyTraceOutput(
+            loss=loss,
+            logits=full_logits,
+            text_logits=text_logits,
+            time_logits=time_logits,
+            score_logits=score_logits,
+            loss_components=loss_components,
+            weighted_loss_components=weighted_loss_components,
+            target_counts=target_counts,
+        )
 
     @torch.no_grad()
     def generate(
@@ -440,6 +498,13 @@ class TinyTraceModel(nn.Module):
             raise ValueError(
                 "TinyTrace generation currently supports batch size 1. "
                 "Per-sequence adaptive head state is not implemented yet."
+            )
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool) or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer.")
+        if max_new_tokens > self.config.max_generated_tokens:
+            raise ValueError(
+                f"max_new_tokens={max_new_tokens} exceeds the configured limit "
+                f"{self.config.max_generated_tokens}."
             )
         generated = prompt_ids.clone()
         mode = "time"

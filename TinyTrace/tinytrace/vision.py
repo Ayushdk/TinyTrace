@@ -156,11 +156,13 @@ class MobileCLIPSpatialEncoder(nn.Module):
             frames,
             output_size=[self.config.image_size, self.config.image_size],
         )
-        return self._normalize(
-            frames,
-            self.config.mobileclip_image_mean,
-            self.config.mobileclip_image_std,
-        )
+        if self.config.mobileclip_apply_normalization:
+            frames = self._normalize(
+                frames,
+                self.config.mobileclip_image_mean,
+                self.config.mobileclip_image_std,
+            )
+        return frames
 
     @staticmethod
     def _normalize(
@@ -174,7 +176,7 @@ class MobileCLIPSpatialEncoder(nn.Module):
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         frames = self.preprocess(frames)
-        context = torch.no_grad() if self.config.freeze_visual_encoder else torch.enable_grad()
+        context = torch.no_grad() if self.trainable_strategy == "frozen" else torch.enable_grad()
         with context:
             features = self.backbone.forward_embeddings(frames)
             features = self.backbone.forward_tokens(features)

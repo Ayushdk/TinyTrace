@@ -25,6 +25,14 @@ def serialize_example(
     score_tokenizer: NumericTokenizer,
 ) -> tuple[list[int], list[int], int]:
     """Build the canonical instruction + causal event target sequence."""
+    if not isinstance(events, list):
+        raise ValueError("events must be a list.")
+    if len(events) > config.max_events:
+        raise ValueError(
+            f"Received {len(events)} events, but max_events={config.max_events}."
+        )
+    if not isinstance(instruction, str):
+        raise ValueError("instruction must be a string.")
     instruction_ids = [config.bos_token_id]
     instruction_ids.extend(text_tokenizer.encode(instruction)[: config.max_text_len])
     instruction_ids.append(config.video_token_id)
@@ -34,6 +42,8 @@ def serialize_example(
     label_types = [LabelType.IGNORE] * prompt_length
 
     for event_index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ValueError(f"Event {event_index} must be an object.")
         timestamps = event.get("timestamp")
         scores = event.get("score")
         caption = event.get("caption")

@@ -53,6 +53,14 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual(len(token_ids), len(label_types))
         self.assertTrue(all(label_type == -1 for label_type in label_types[:prompt_length]))
 
+    def test_serialization_rejects_more_than_configured_events(self) -> None:
+        config = TinyTraceConfig(max_events=1)
+        text, time, score = tokenizers(config)
+        event = {"timestamp": [0.0, 1.0], "score": [3.0], "caption": "action"}
+
+        with self.assertRaisesRegex(ValueError, "max_events=1"):
+            serialize_example([event, event], "localize", config, text, time, score)
+
     def test_malformed_parser_is_safe_by_default_and_strict_on_request(self) -> None:
         config = TinyTraceConfig()
         text, time, score = tokenizers(config)
@@ -92,6 +100,112 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual(output.logits.shape, (1, expected_length, config.total_token_vocab))
         self.assertIsNotNone(output.loss)
         self.assertTrue(torch.isfinite(output.loss))
+        self.assertEqual(
+            set(output.loss_components),
+            {"text", "caption_sync", "time", "time_sync", "score", "score_sync", "boundary"},
+        )
+        self.assertTrue(all(count > 0 for count in output.target_counts.values()))
+        self.assertTrue(
+            torch.allclose(
+                output.loss,
+                sum(output.weighted_loss_components.values()),
+            )
+        )
+
+    def test_multi_task_loss_weights_change_only_aggregation(self) -> None:
+        config = TinyTraceConfig(max_frames=1, score_loss_weight=2.0)
+        model = TinyTraceModel(config, mobileclip_backbone=FakeMobileCLIPBackbone())
+        components = {
+            "time": torch.tensor(1.0, requires_grad=True),
+            "score": torch.tensor(2.0, requires_grad=True),
+            "text": torch.tensor(3.0, requires_grad=True),
+        }
+
+        total, weighted = model._combine_loss_components(components)
+
+        self.assertIsNotNone(total)
+        self.assertEqual(total.item(), 8.0)
+        self.assertEqual(weighted["time"].item(), 1.0)
+        self.assertEqual(weighted["score"].item(), 4.0)
+        self.assertEqual(weighted["text"].item(), 3.0)
+        self.assertEqual(components["score"].item(), 2.0)
+
+    def test_ignored_padding_does_not_change_loss_components(self) -> None:
+        config = TinyTraceConfig(max_frames=1)
+        model = TinyTraceModel(config, mobileclip_backbone=FakeMobileCLIPBackbone()).eval()
+        text, time, score = tokenizers(config)
+        token_ids, label_types, _ = serialize_example(
+            [{"timestamp": [0.0, 1.0], "score": [3.0], "caption": "action"}],
+            "localize",
+            config,
+            text,
+            time,
+            score,
+        )
+        tokens = torch.tensor([token_ids])
+        types_tensor = torch.tensor([label_types])
+        padded_tokens = torch.cat([tokens, torch.zeros(1, 2, dtype=torch.long)], dim=1)
+        padded_types = torch.cat([types_tensor, torch.full((1, 2), -1, dtype=torch.long)], dim=1)
+        frames = torch.rand(1, 1, 3, 32, 32)
+        frame_times = torch.zeros(1, 1)
+
+        direct = model(frames, frame_times, tokens, labels=tokens, label_types=types_tensor)
+        padded = model(
+            frames,
+            frame_times,
+            padded_tokens,
+            labels=padded_tokens,
+            label_types=padded_types,
+        )
+
+        self.assertEqual(set(direct.loss_components), set(padded.loss_components))
+        for name in direct.loss_components:
+            self.assertTrue(torch.allclose(direct.loss_components[name], padded.loss_components[name]))
+
+    def test_multi_task_loss_reaches_all_task_heads(self) -> None:
+        config = TinyTraceConfig(max_frames=1)
+        model = TinyTraceModel(config, mobileclip_backbone=FakeMobileCLIPBackbone())
+        text, time, score = tokenizers(config)
+        token_ids, label_types, _ = serialize_example(
+            [{"timestamp": [0.0, 1.0], "score": [3.0], "caption": "action"}],
+            "localize",
+            config,
+            text,
+            time,
+            score,
+        )
+        tokens = torch.tensor([token_ids])
+        output = model(
+            torch.rand(1, 1, 3, 32, 32),
+            torch.zeros(1, 1),
+            tokens,
+            labels=tokens,
+            label_types=torch.tensor([label_types]),
+        )
+
+        output.loss.backward()
+
+        self.assertIsNotNone(model.text_head.weight.grad)
+        self.assertIsNotNone(model.time_head.weight.grad)
+        self.assertIsNotNone(model.score_head.weight.grad)
+
+    def test_forward_requires_paired_and_shape_aligned_labels(self) -> None:
+        config = TinyTraceConfig(max_frames=1)
+        model = TinyTraceModel(config, mobileclip_backbone=FakeMobileCLIPBackbone())
+        frames = torch.rand(1, 1, 3, 16, 16)
+        times = torch.zeros(1, 1)
+        tokens = torch.tensor([[config.bos_token_id, config.video_token_id]])
+
+        with self.assertRaisesRegex(ValueError, "both be provided"):
+            model(frames, times, tokens, labels=tokens)
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            model(
+                frames,
+                times,
+                tokens,
+                labels=torch.ones(1, 1, dtype=torch.long),
+                label_types=torch.ones(1, 1, dtype=torch.long),
+            )
 
     def test_generation_switches_time_score_caption(self) -> None:
         config = TinyTraceConfig(

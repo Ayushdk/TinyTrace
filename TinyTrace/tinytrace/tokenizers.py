@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -15,7 +16,13 @@ class NumericTokenizer:
     def encode(self, values: list[float]) -> list[int]:
         tokens: list[int] = []
         for index, value in enumerate(values):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"Numeric value must be finite, received {value!r}.")
             formatted = format(value, f"0>{self.width}.1f")
+            if len(formatted) != self.width or any(character not in self.token_to_id for character in formatted):
+                raise ValueError(
+                    f"Numeric value {value!r} cannot be represented in fixed width {self.width}."
+                )
             for char in formatted:
                 tokens.append(self.token_to_id[char])
             if index < len(values) - 1:

@@ -188,6 +188,22 @@ def build_optimizer(
     return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
 
+def rebuild_optimizer_preserving_state(
+    model: TinyTraceModel,
+    optimizer: torch.optim.Optimizer,
+    lr: float,
+    weight_decay: float,
+    visual_lr_scale: float,
+) -> torch.optim.Optimizer:
+    """Add newly trainable parameters without resetting existing Adam state."""
+    rebuilt = build_optimizer(model, lr, weight_decay, visual_lr_scale=visual_lr_scale)
+    for group in rebuilt.param_groups:
+        for parameter in group["params"]:
+            if parameter in optimizer.state:
+                rebuilt.state[parameter] = optimizer.state[parameter]
+    return rebuilt
+
+
 def save_checkpoint(
     path: Path,
     model: TinyTraceModel,
@@ -196,6 +212,7 @@ def save_checkpoint(
     epoch: int,
     best_loss: float,
     history: list[dict],
+    training_state: dict | None = None,
 ) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
@@ -206,6 +223,7 @@ def save_checkpoint(
             "epoch": epoch,
             "best_loss": best_loss,
             "history": history,
+            "training_state": dict(training_state or {}),
         },
         temporary,
     )
@@ -340,12 +358,29 @@ def main() -> None:
     )
 
     model = TinyTraceModel(config, load_pretrained_visual=resume_payload is None).to(device)
-    optimizer = build_optimizer(model, args.lr, args.weight_decay)
     start_epoch = 1
     best_loss = float("inf")
     history: list[dict] = []
+    stage2_activated = False
+    active_stage2_strategy = args.stage2_unfreeze_strategy
     if resume_payload is not None:
         model.load_state_dict(resume_payload["model_state"])
+        saved_training_state = resume_payload.get("training_state", {})
+        saved_optimizer_groups = len(resume_payload["optimizer_state"].get("param_groups", []))
+        stage2_activated = bool(saved_training_state.get("stage2_activated", False)) or saved_optimizer_groups > 1
+        active_stage2_strategy = str(
+            saved_training_state.get("stage2_unfreeze_strategy", args.stage2_unfreeze_strategy)
+        )
+        if stage2_activated:
+            model.set_visual_encoder_trainable(True, strategy=active_stage2_strategy)
+
+    optimizer = build_optimizer(
+        model,
+        args.lr,
+        args.weight_decay,
+        visual_lr_scale=args.stage2_visual_lr_scale if stage2_activated else 1.0,
+    )
+    if resume_payload is not None:
         optimizer.load_state_dict(resume_payload["optimizer_state"])
         start_epoch = int(resume_payload["epoch"]) + 1
         best_loss = float(resume_payload.get("best_loss", float("inf")))
@@ -359,7 +394,6 @@ def main() -> None:
     prediction_dir.mkdir(parents=True, exist_ok=True)
     Path(args.frame_cache_dir).mkdir(parents=True, exist_ok=True)
     atomic_json(output_dir / "config.json", config.to_dict())
-    stage2_activated = False
 
     if start_epoch > args.epochs:
         raise ValueError(
@@ -373,13 +407,15 @@ def main() -> None:
             and not stage2_activated
         ):
             model.set_visual_encoder_trainable(True, strategy=args.stage2_unfreeze_strategy)
-            optimizer = build_optimizer(
+            optimizer = rebuild_optimizer_preserving_state(
                 model,
+                optimizer,
                 args.lr,
                 args.weight_decay,
                 visual_lr_scale=args.stage2_visual_lr_scale,
             )
             stage2_activated = True
+            active_stage2_strategy = args.stage2_unfreeze_strategy
             print(
                 f"stage2_enabled epoch={epoch} strategy={args.stage2_unfreeze_strategy} "
                 f"visual_lr_scale={args.stage2_visual_lr_scale}"
@@ -430,6 +466,12 @@ def main() -> None:
             epoch,
             best_loss,
             history,
+            training_state={
+                "stage2_activated": stage2_activated,
+                "stage2_unfreeze_strategy": active_stage2_strategy,
+                "stage2_start_epoch": args.stage2_start_epoch,
+                "stage2_visual_lr_scale": args.stage2_visual_lr_scale,
+            },
         )
         if improved:
             save_checkpoint(
@@ -440,6 +482,12 @@ def main() -> None:
                 epoch,
                 best_loss,
                 history,
+                training_state={
+                    "stage2_activated": stage2_activated,
+                    "stage2_unfreeze_strategy": active_stage2_strategy,
+                    "stage2_start_epoch": args.stage2_start_epoch,
+                    "stage2_visual_lr_scale": args.stage2_visual_lr_scale,
+                },
             )
             torch.save(
                 {
@@ -460,6 +508,12 @@ def main() -> None:
                 epoch,
                 best_loss,
                 history,
+                training_state={
+                    "stage2_activated": stage2_activated,
+                    "stage2_unfreeze_strategy": active_stage2_strategy,
+                    "stage2_start_epoch": args.stage2_start_epoch,
+                    "stage2_visual_lr_scale": args.stage2_visual_lr_scale,
+                },
             )
         if args.prediction_every > 0 and epoch % args.prediction_every == 0:
             prediction_dataset = val_dataset if val_dataset is not None else train_dataset
