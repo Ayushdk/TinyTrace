@@ -118,6 +118,35 @@ class JsonTinyTraceDataset(Dataset):
             raise ValueError("TinyTrace JSON dataset must be a list of samples.")
         self.items = self._filter_valid_items(payload)
 
+    def _resolve_video_path(self, video_path: str) -> Path:
+        source = Path(video_path)
+        if source.is_absolute():
+            return source
+        if source.is_file():
+            return source.resolve()
+
+        annotation_root = self.annotation_path.parent
+        candidates = [
+            annotation_root / source,
+            annotation_root.parent / source,
+            annotation_root.parent.parent / source,
+        ]
+
+        source_parts = source.parts
+        if source_parts and source_parts[0] == "final_qvhighlights_tinytrace":
+            trimmed = Path(*source_parts[1:])
+            candidates.extend(
+                [
+                    annotation_root.parent / trimmed,
+                    annotation_root.parent.parent / trimmed,
+                ]
+            )
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        return source
+
     def _filter_valid_items(self, payload: list[dict]) -> list[dict]:
         valid_items = []
         skipped_missing = 0
@@ -128,12 +157,14 @@ class JsonTinyTraceDataset(Dataset):
                 valid_items.append(item)
                 continue
 
-            source = Path(video_path)
+            source = self._resolve_video_path(video_path)
             if not source.is_file():
                 skipped_missing += 1
                 continue
+            item = dict(item)
+            item["video_path"] = str(source)
 
-            duration = self._probe_video_duration(video_path)
+            duration = self._probe_video_duration(str(source))
             if duration <= 0:
                 skipped_invalid += 1
                 continue
