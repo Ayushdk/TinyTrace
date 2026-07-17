@@ -1,0 +1,188 @@
+// TinyTrace canonical configuration reference — DOCUMENTATION ONLY.
+//
+// The TinyTrace launchers accept ordinary JSON, not JSONC, and expect model
+// and training settings in separate files. Do not pass this file to
+// run_training_profile.py or train_tinytrace.py. Copy only reviewed values into
+// a new experiment JSON; never overwrite an existing reported profile.
+//
+// See ../TRAINING_REFERENCE.md for valid ranges, expected accuracy/speed/memory
+// effects, retraining requirements, stability, and Priority provenance.
+{
+  "reference_metadata": {
+    "purpose": "single readable map of TinyTrace configuration",
+    "approved_reference": "frozen MobileCLIP-S0, 8 frames, 20 caption tokens",
+    "model_source": "tinytrace/config.py:TinyTraceConfig",
+    "training_source": "tinytrace/training.py:TrainingProfile",
+    "existing_profiles_are_unchanged": true
+  },
+
+  // Values below reproduce the approved model/representation baseline.
+  "model": {
+    // Representation and MobileCLIP (Priority 1; frame budget bounded in P4)
+    "image_size": 256,
+    "max_frames": 8, // P4 ladder: 8 -> 12 -> 16 -> 24 -> 32
+    "visual_hidden_dim": 1024,
+    "compressed_visual_tokens": 4,
+    "time_tokens_per_frame": 6,
+    "mobileclip_model_name": "mobileclip_s0",
+    "mobileclip_checkpoint": "checkpoints/mobileclip_s0.pt",
+    "mobileclip_checkpoint_sha256": "809b408eff74f8058843e86a1f92967097d42ba782450e85b8f4867b7f0ca0b7",
+    "freeze_visual_encoder": true,
+    "mobileclip_apply_normalization": false, // Required by pinned Apple S0 transform
+    "mobileclip_image_mean": [0.48145466, 0.4578275, 0.40821073],
+    "mobileclip_image_std": [0.26862954, 0.26130258, 0.27577711],
+
+    // LCEM architecture (Priority 1; do not scale without evidence)
+    "d_model": 192,
+    "num_layers": 4,
+    "num_heads": 6,
+    "mlp_ratio": 4,
+    "dropout": 0.0, // P3 experimental candidate: 0.1
+    "max_position_embeddings": 2048,
+
+    // Multi-task loss aggregation (P1 contract, P2 observability)
+    "time_loss_weight": 1.0,
+    "score_loss_weight": 1.0,
+    "caption_loss_weight": 1.0,
+    "sync_loss_weight": 1.0,
+    "boundary_loss_weight": 1.0,
+
+    // Text/event/generation protocol (P1; caption alternatives introduced P4)
+    "text_vocab_size": 256,
+    "max_text_len": 48,
+    "max_caption_tokens": 20, // P4 candidates: 48 or 64
+    "min_caption_tokens": 5,
+    "max_events": 3,
+    "max_generated_tokens": 128, // 202 for caption-48; 250 for caption-64
+    "timestamp_value_count": 2,
+    "score_value_count": 1,
+
+    // Fixed TRACE numeric vocabularies; order is validated and must not change.
+    "time_vocab": ["<sync>", "<sep>", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "."],
+    "score_vocab": ["<sync>", "<sep>", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "."],
+
+    // Fixed text protocol IDs.
+    "pad_token_id": 0,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "video_token_id": 3,
+    "instruction_token_offset": 4
+  },
+
+  // A complete approved normal-training reference. Paths are examples and
+  // must point to manually verified, disjoint train/validation splits.
+  "training_profile": {
+    // Entry points and datasets (P1/P3)
+    "train_script": "TinyTrace/scripts/train_tinytrace.py",
+    "model_config": "TinyTrace/configs/tinytrace_baseline.json",
+    "train_dataset_json": "PATH/TO/tinytrace_train.json",
+    "val_dataset_json": "PATH/TO/tinytrace_val.json",
+    "output_dir": "TinyTrace/outputs-reference-run",
+    "frame_cache_dir": "TinyTrace/.cache/frames_reference_v1",
+    "allow_random_frames": false,
+    "dataset_size": 128, // Used only when train_dataset_json is empty
+    "num_workers": 2,
+
+    // Core run control
+    "device": "cuda",
+    "epochs": 10,
+    "batch_size": 2,
+    "max_steps_per_epoch": 0, // 0 = full epoch; positive = smoke/debug only
+
+    // Optimizer and scheduler (Priority 2)
+    "lr": 0.0003,
+    "weight_decay": 0.01,
+    "gradient_clip": 1.0,
+    "warmup_ratio": 0.05,
+    "min_lr_ratio": 0.1,
+
+    // Precision and effective batch (P2/P3)
+    "amp": "off", // off | auto | fp16 | bf16; use auto only after parity smoke
+    "accumulation_steps": 1,
+
+    // Validation selection and early stopping (P2/P3)
+    "monitor": "val_loss",
+    "monitor_mode": "min",
+    "early_stopping_patience": 0, // 0 disables
+    "early_stopping_min_delta": 0.0,
+    "early_stopping_min_epochs": 1,
+    "metrics_every": 1,
+
+    // Checkpointing and exact resume (P2/P3)
+    "resume": "",
+    "save_every": 1,
+    "checkpoint_keep": 3,
+
+    // Logging and deterministic prediction artifacts (P2/P3)
+    "log_every": 25,
+    "prediction_every": 1,
+    "prediction_samples": 2,
+
+    // Partial MobileCLIP fine-tuning controls (experimental).
+    // The approved frozen baseline uses 0. The existing final_train_qvh500.json
+    // uses 6, which is an operational experimental value, not the frozen baseline.
+    "stage2_start_epoch": 0,
+    "stage2_visual_lr_scale": 0.05,
+    "stage2_unfreeze_strategy": "conv_exp",
+
+    // Reproducibility (Priority 3)
+    "seed": 7,
+    "deterministic": true
+  },
+
+  // Proposed overrides for the upcoming 2,000-video frozen-reference run.
+  // First validate them with a 50–100 optimizer-step smoke test on target GPU.
+  "recommended_qvh2000_overrides": {
+    "train_dataset_json": "PATH/TO/tinytrace_train_2000.json",
+    "val_dataset_json": "PATH/TO/tinytrace_val.json",
+    "output_dir": "TinyTrace/outputs-qvh-2000-frozen-v1",
+    "frame_cache_dir": "TinyTrace/.cache/frames_qvh2000_v1",
+    "epochs": 15,
+    "batch_size": 2,
+    "accumulation_steps": 4, // Effective batch 8 on one device
+    "amp": "auto",
+    "early_stopping_patience": 3,
+    "early_stopping_min_delta": 0.0,
+    "early_stopping_min_epochs": 5,
+    "metrics_every": 2,
+    "prediction_every": 1,
+    "prediction_samples": 4,
+    "num_workers": 2,
+    "log_every": 50,
+    "stage2_start_epoch": 0
+  },
+
+  // Priority 4 representation-ablation runner reference. These are CLI
+  // parameters, not fields accepted by TrainingProfile.
+  "representation_ablation": {
+    "training_profile": "TinyTrace/configs/EXPERIMENT_BASE.json",
+    "kind": "frame", // frame | caption
+    "baseline_frames": 8, // frame ladder comparisons must be sequential
+    "caption_candidate": 48, // 48 | 64, each compared against 20
+    "output_root": "TinyTrace/outputs-representation-ablation",
+    "execute": false, // Review the dry-run manifest before changing to true
+    "benchmark_samples": 2,
+    "benchmark_warmup": 1,
+    "benchmark_repeats": 5
+  },
+
+  // Standalone systems benchmark arguments (Priority 4).
+  "representation_benchmark": {
+    "config": "TinyTrace/configs/tinytrace_baseline.json",
+    "checkpoint": "PATH/TO/best-primary-metric.pt",
+    "dataset_json": "PATH/TO/tinytrace_val.json",
+    "frame_cache_dir": "TinyTrace/.cache/frames_reference_v1",
+    "output": "PATH/TO/representation_benchmark.json",
+    "device": "cuda",
+    "samples": 2,
+    "warmup": 1,
+    "repeats": 5
+  },
+
+  // No-acquisition temporal/caption analysis arguments (Priority 4).
+  "representation_analysis": {
+    "duration": [], // Optional repeated positive duration values in seconds
+    "dataset_json": "PATH/TO/tinytrace_val.json",
+    "output": "PATH/TO/coverage.json"
+  }
+}
